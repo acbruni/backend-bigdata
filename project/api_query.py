@@ -1,5 +1,5 @@
 # project/api_query.py
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from typing import List, Optional
 from pyspark.sql import SparkSession, DataFrame, functions as F
@@ -9,6 +9,13 @@ import os, glob, json
 # ─────────────────────────────
 # Helpers / compat
 # ─────────────────────────────
+try:
+    # FastAPI re-export (preferito)
+    from fastapi.middleware.cors import CORSMiddleware
+except ImportError:
+    # Fallback per versioni vecchie
+    from starlette.middleware.cors import CORSMiddleware
+    
 def _MEMORY_ONLY_SER():
     try:
         return StorageLevel.MEMORY_ONLY_SER
@@ -52,6 +59,15 @@ def create_app(spark: SparkSession, prepared_dir: str, files_limit: Optional[int
     """
     app = FastAPI(title="Disaster Tweets API (queries su dati preparati)")
 
+    # CORS: permette localhost e 127.0.0.1 su qualunque porta
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=r"^https?://(localhost|127.0.0.1)(:\d+)?$",
+        allow_credentials=True,
+        allow_methods=[""],
+        allow_headers=[""],
+    )
+
     # stato interno condiviso dagli endpoint
     df_prepared: DataFrame | None = None  # chiusura
     used_files: List[str] = []            # per health/debug
@@ -91,14 +107,21 @@ def create_app(spark: SparkSession, prepared_dir: str, files_limit: Optional[int
 
     @app.get("/health")
     def health():
-        total = len(_list_prep_files(prepared_dir))
-        return JSONResponse({
-            "status": "ok",
-            "files_total_in_dir": total,
-            "files_used_for_queries": len(used_files),
-            "sample_used_files": used_files[:5],  # piccola anteprima
-            "df_cached": bool(df_prepared is not None)
-        })
+        try:
+            total = len(_list_prep_files(prepared_dir))
+            used = used_files if isinstance(used_files, list) else []
+            df_cached = bool(globals().get('df_prepared') is not None)
+
+            return JSONResponse({
+                "status": "ok",
+                "files_total_in_dir": total,
+                "files_used_for_queries": len(used),
+                "sample_used_files": used[:5],
+                "df_cached": df_cached,
+            })
+        except Exception as e:
+            # In caso di errore, torna 500 con un dettaglio utile
+            raise HTTPException(status_code=500, detail=f"health failed: {e}")
 
     @app.post("/reload")
     def reload():
