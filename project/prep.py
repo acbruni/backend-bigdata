@@ -116,6 +116,8 @@ def _canon_place(col):
 # ─────────────────────────────────────────────────────────
 # Prep (come nel tuo query.py) + place_norm
 # ─────────────────────────────────────────────────────────
+from pyspark.sql import DataFrame, functions as F
+
 def prep(df: DataFrame) -> DataFrame:
     # parsing robusto del created_at di Twitter
     arr = F.split(F.col("created_at"), r"\s+")
@@ -131,8 +133,7 @@ def prep(df: DataFrame) -> DataFrame:
         F.lit("Jul"), F.lit("07"), F.lit("Aug"), F.lit("08"), F.lit("Sep"), F.lit("09"),
         F.lit("Oct"), F.lit("10"), F.lit("Nov"), F.lit("11"), F.lit("Dec"), F.lit("12"),
     )
-    mon_num = F.element_at(month_map, mon_abbr)
-
+    mon_num  = F.element_at(month_map, mon_abbr)
     iso_like = F.concat_ws(" ", F.concat_ws("-", year, mon_num, day), time_, zone)
 
     ts_robust = F.when(
@@ -141,14 +142,17 @@ def prep(df: DataFrame) -> DataFrame:
     )
     ts = F.coalesce(ts_robust, F.to_timestamp(F.col("created_at")))
 
-    fav_src = F.coalesce(F.col("retweeted_status.favorite_count").cast("long"),
-                         F.col("favorite_count").cast("long"))
-    rt_src  = F.coalesce(F.col("retweeted_status.retweet_count").cast("long"),
-                         F.col("retweet_count").cast("long"))
+    fav_src = F.coalesce(
+        F.col("retweeted_status.favorite_count").cast("long"),
+        F.col("favorite_count").cast("long")
+    )
+    rt_src = F.coalesce(
+        F.col("retweeted_status.retweet_count").cast("long"),
+        F.col("retweet_count").cast("long")
+    )
 
     base = (
         df.withColumn("ts", ts)
-          .withColumn("hour", F.date_trunc("hour", F.col("ts")))
           .withColumn("text_full", F.coalesce(F.col("extended_tweet.full_text"), F.col("text")))
           .withColumn("verified", F.coalesce(F.col("user.verified"), F.lit(False)))
           .withColumn("is_rt", F.col("retweeted_status").isNotNull() | F.col("text").rlike(r"^RT @"))
@@ -159,22 +163,29 @@ def prep(df: DataFrame) -> DataFrame:
           )
           .withColumn(
               "hashtags_arr",
-              F.when(F.col("entities.hashtags").isNotNull(),
-                     F.expr("transform(entities.hashtags, x -> lower(x.text))"))
-               .otherwise(F.array())
+              F.when(
+                  F.col("entities.hashtags").isNotNull(),
+                  F.expr("transform(entities.hashtags, x -> lower(x.text))")
+              ).otherwise(F.array())
           )
           .withColumn(
               "mentions_count",
               F.when(F.col("entities.user_mentions").isNotNull(),
-                     F.size(F.col("entities.user_mentions"))).otherwise(F.lit(0))
+                     F.size(F.col("entities.user_mentions")))
+               .otherwise(F.lit(0))
           )
           .withColumn("has_mentions", F.col("mentions_count") > 0)
-          .withColumn(
-              "place",
-              F.coalesce(F.col("place.full_name"), F.col("place.name"), F.col("user.location"))
-          )
+          .withColumn("place", F.coalesce(F.col("place.full_name"), F.col("place.name"), F.col("user.location")))
     )
 
+    # ──> Nuove colonne temporali (UTC)
+    base = (
+        base.withColumn("ts", F.to_timestamp("ts"))
+            .withColumn("hour_ts",     F.date_trunc("hour", F.col("ts")).cast("timestamp"))  # per timeline
+            .withColumn("hour_of_day",  F.hour(F.col("ts")).cast("int"))                      # 0–23
+    )
+
+    # Normalizzazione luogo
     return base.withColumn("place_norm", _canon_place(F.coalesce(F.col("place"), F.lit(""))))
 
 # ─────────────────────────────────────────────────────────
