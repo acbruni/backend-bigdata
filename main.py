@@ -8,6 +8,11 @@ from project import prep
 from project.api_query import create_app   # deve supportare files_limit opzionale, come da tua versione
 from project.model import add_model_routes
 
+try:
+    from fastapi.middleware.cors import CORSMiddleware
+except ImportError:
+    from starlette.middleware.cors import CORSMiddleware
+
 def main():
     # 1) Percorsi
     INPUT_PATH        = "/Users/acb_23/Documents/materialeBigData/progettoBigData/backend-bigdata-1/project/dataset"
@@ -58,6 +63,15 @@ def main():
 
     # 5) App query (lavora su prep_ds invece che su new_ds)
     app = create_app(spark, PREP_DIR, files_limit=QUERY_FILES_LIMIT)
+
+        # CORS (DEV): permetti tutto; in prod metti la lista di origini
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],         # in dev è la via più semplice
+        allow_credentials=False,     # True non serve qui
+        allow_methods=["*"],         # include OPTIONS per preflight
+        allow_headers=["*"],
+    )
 
     # 6) Route modello (lavora su prep_ds invece che su new_ds)
     add_model_routes(app, spark, prepared_dir=PREP_DIR, model_root=MODEL_DIR, default_files_limit=MODEL_FILES_LIMIT)

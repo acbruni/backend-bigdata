@@ -1,332 +1,446 @@
 # project/model.py
 from __future__ import annotations
 
-import os, json, glob, math
-from datetime import datetime
-from typing import Dict, Optional, List, Tuple
+import os, glob, json, shutil
+from typing import List, Dict, Any, Optional
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.responses import JSONResponse
 
-from pyspark.sql import SparkSession, DataFrame, functions as F
+from pyspark.sql import SparkSession, DataFrame, functions as F, types as T
+from pyspark import StorageLevel
 from pyspark.ml import Pipeline, PipelineModel
-from pyspark.ml.feature import VectorAssembler
-from pyspark.ml.classification import RandomForestClassifier
-from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+from pyspark.ml.feature import (
+    RegexTokenizer,
+    StopWordsRemover,
+    CountVectorizer,
+    IDF,
+    VectorAssembler,
+)
+from pyspark.ml.classification import LogisticRegression
 
-# ─────────────────────────────────────────────────────────
-# Utilità base
-# ─────────────────────────────────────────────────────────
-_TS_FMT = "%Y%m%d-%H%M%S"
 
-def _now_tag() -> str:
-    return datetime.now().strftime(_TS_FMT)
+# ─────────────────────────────────────────────────────────────
+# Parametri e percorsi modello
+# ─────────────────────────────────────────────────────────────
+MODEL_SUBDIR  = "info_mlr_model"         # il train sovrascrive qui
+META_FILENAME = "info_mlr_meta.json"
 
-def _ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
+# classi: indice → nome
+CLASS_INDEX = {
+    0: "Request/Need",
+    1: "Offer/Donation",
+    2: "Damage/Impact",
+    3: "Other"
+}
+CLASS_NAME_TO_INDEX = {v: k for k, v in CLASS_INDEX.items()}
 
-def _write_small_json(obj: dict, out_path: str):
-    _ensure_dir(os.path.dirname(out_path))
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
+# parole chiave per etichettatura "silver" (minuscole)
+KEYWORDS = {
+    "Request/Need": {
+        "text": ["need", "help", "urgent", "please send", "request", "rescue", "shelter needed", "trapped", "asap"],
+        "tags": ["help", "rescue", "needs", "shelter"]
+    },
+    "Offer/Donation": {
+        "text": ["donate", "donations", "volunteer", "offering", "provide", "supplies available", "fundraiser"],
+        "tags": ["donate", "volunteer", "relief", "fundraiser"]
+    },
+    "Damage/Impact": {
+        "text": ["damage", "flooded", "power out", "outage", "sewage", "water", "roads closed", "bridge", "hospital"],
+        "tags": ["flood", "damage", "powerout", "water", "sewage"]
+    }
+}
 
-def _list_prep_files(prepared_dir: str, limit: Optional[int] = None) -> List[str]:
+
+# ─────────────────────────────────────────────────────────────
+# Helper
+# ─────────────────────────────────────────────────────────────
+def _list_json_files(prepared_dir: str, limit: Optional[int]) -> List[str]:
+    """Lista deterministica di file .json/.jsonl dentro prepared_dir (e sottocartelle). Applica lo slice al limite."""
+    if not os.path.isdir(prepared_dir):
+        return []
     patterns = [
-        os.path.join(prepared_dir, "*_prepped.jsonl"),
-        os.path.join(prepared_dir, "*.jsonl"),
-        os.path.join(prepared_dir, "*/*.jsonl"),
         os.path.join(prepared_dir, "*.json"),
+        os.path.join(prepared_dir, "*.jsonl"),
         os.path.join(prepared_dir, "*/*.json"),
+        os.path.join(prepared_dir, "*/*.jsonl"),
     ]
-    out: List[str] = []
+    files: List[str] = []
     for p in patterns:
-        out.extend(glob.glob(p))
-    out = sorted([f for f in out if os.path.isfile(f) and os.path.getsize(f) > 0])
-    if limit is not None:
-        out = out[: int(limit)]
-    return out
+        files.extend(glob.glob(p))
+    files = sorted(set(files))
+    if limit is not None and limit > 0:
+        return files[:limit]
+    return files
 
-def _find_latest_run(model_root: str) -> Optional[str]:
-    txt = os.path.join(model_root, "latest_path.txt")
-    if os.path.isfile(txt):
-        with open(txt, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    cand = sorted([p for p in glob.glob(os.path.join(model_root, "rf_*")) if os.path.isdir(p)])
-    return cand[-1] if cand else None
 
-# ─────────────────────────────────────────────────────────
-# Target binario: aggiunge SOLO la colonna label
-# ─────────────────────────────────────────────────────────
-def add_label(df: DataFrame, viral_quantile: float = 0.70, viral_threshold: Optional[int] = None) -> DataFrame:
-    """
-    Crea label binaria: 1 se 'engagement' >= soglia (se fornita) altrimenti > quantile.
-    Non crea nuove feature: si assume che quelle necessarie siano già nel dataset preparato.
-    """
-    if viral_threshold is not None:
-        return df.withColumn("label", (F.col("engagement") >= F.lit(int(viral_threshold))).cast("int"))
-    q = df.approxQuantile("engagement", [viral_quantile], 0.01)[0]
-    return df.withColumn("label", (F.col("engagement") > F.lit(q)).cast("int"))
+def _require_cols(df: DataFrame, cols: List[str]) -> None:
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Mancano colonne richieste: {missing}")
 
-# Candidati: useremo SOLO quelli realmente presenti nel dataset preparato
-CANDIDATE_FEATURES = [
-    "len_text","word_count","hashtags_count","mentions_count",
-    "is_rt","verified","hour_sin","hour_cos",
-    "log_followers","log_friends","log_statuses",
-    # se nel prep hai altre numeriche, lasciale qui: verranno usate solo se presenti
-]
 
-# ─────────────────────────────────────────────────────────
-# Metriche: built-in evaluator + confusion matrix
-# ─────────────────────────────────────────────────────────
-def _compute_metrics(pred_df: DataFrame) -> Tuple[float, float, float, List[Tuple[int,int,int]]]:
-    ev = MulticlassClassificationEvaluator(labelCol="label", predictionCol="prediction")
-    precision = float(ev.setMetricName("weightedPrecision").evaluate(pred_df))
-    recall    = float(ev.setMetricName("weightedRecall").evaluate(pred_df))
-    f1        = float(ev.setMetricName("f1").evaluate(pred_df))
-    cm_rows = (pred_df.groupBy("label","prediction").count().orderBy("label","prediction").collect())
-    cm = [(int(r["label"]), int(r["prediction"]), int(r["count"])) for r in cm_rows]
-    return precision, recall, f1, cm
+# ─────────────────────────────────────────────────────────────
+# Etichette silver (4 classi)
+# ─────────────────────────────────────────────────────────────
+def _label_silver(df: DataFrame) -> DataFrame:
+    empty_arr = F.lit([]).cast("array<string>")
+    txt  = F.lower(F.coalesce(F.col("text_full").cast("string"), F.lit("")))
+    tags = F.coalesce(F.col("hashtags_arr").cast("array<string>"), empty_arr)
 
-# ─────────────────────────────────────────────────────────
-# Train / Load
-# ─────────────────────────────────────────────────────────
-def train_classifier(
-    spark: SparkSession,
-    prepared_dir: str,
-    model_root: str,
-    files_limit: Optional[int] = None,
-    viral_quantile: float = 0.70,
-    viral_threshold: Optional[int] = None,
-    n_trees: int = 100,
-    # compatibilità con main/route: accettiamo ma NON usiamo questi parametri
-    max_bins: int = 128,
-    top_k_lang: int = 30,
-    top_k_device: int = 30,
-    debug_logs: bool = True,
-) -> Dict:
-    files = _list_prep_files(prepared_dir, limit=files_limit)
-    if not files:
-        raise RuntimeError(f"Nessun file preparato trovato in {prepared_dir} (files_limit={files_limit})")
+    def contains_any_text(col, words: List[str]):
+        cond = F.lit(False)
+        for w in words:
+            cond = cond | (F.instr(col, F.lit(w)) > F.lit(0))
+        return cond
 
-    df = spark.read.json(files)
-    df = add_label(df, viral_quantile=viral_quantile, viral_threshold=viral_threshold)
+    def contains_any_tag(col, words: List[str]):
+        cond = F.lit(False)
+        for w in words:
+            cond = cond | F.array_contains(col, F.lit(w))
+        return cond
 
-    # Usa SOLO le colonne che esistono davvero
-    present = set(df.schema.names)
-    used_feats = [c for c in CANDIDATE_FEATURES if c in present]
-    if not used_feats:
-        raise RuntimeError(
-            "Nessuna feature numerica trovata nel dataset preparato. "
-            f"Attese (almeno una): {CANDIDATE_FEATURES}"
-        )
-    if debug_logs:
-        missing = [c for c in CANDIDATE_FEATURES if c not in present]
-        print("[DEBUG] available columns:", df.schema.names)
-        print("[DEBUG] used_feats:", used_feats)
-        if missing:
-            print("[DEBUG] missing_feats (ignorate):", missing)
+    req = contains_any_text(txt, KEYWORDS["Request/Need"]["text"]) | contains_any_tag(tags, KEYWORDS["Request/Need"]["tags"])
+    off = contains_any_text(txt, KEYWORDS["Offer/Donation"]["text"]) | contains_any_tag(tags, KEYWORDS["Offer/Donation"]["tags"])
+    dmg = contains_any_text(txt, KEYWORDS["Damage/Impact"]["text"]) | contains_any_tag(tags, KEYWORDS["Damage/Impact"]["tags"])
 
-    # ⚠️ fill SOLO in subset (evita UNRESOLVED_COLUMN)
-    df = df.na.fill(0, subset=used_feats)
-
-    # split
-    train, test = df.randomSplit([0.8, 0.2], seed=42)
-
-    # class imbalance → pesi
-    dist_tr = train.groupBy("label").count().collect()
-    cnt_tr = {int(r["label"]): int(r["count"]) for r in dist_tr}
-    pos_tr, neg_tr = cnt_tr.get(1, 1), cnt_tr.get(0, 1)
-    tot_tr = float(pos_tr + neg_tr)
-    w_pos = float(neg_tr) / max(1.0, tot_tr)  # più peso alla minoritaria
-    w_neg = float(pos_tr) / max(1.0, tot_tr)
-    class_weights = {"pos": w_pos, "neg": w_neg}
-
-    train = train.withColumn(
-        "cls_weight",
-        F.when(F.col("label") == 1, F.lit(w_pos)).otherwise(F.lit(w_neg))
+    return df.withColumn(
+        "label",
+        F.when(req, F.lit(CLASS_NAME_TO_INDEX["Request/Need"]))
+         .when(off, F.lit(CLASS_NAME_TO_INDEX["Offer/Donation"]))
+         .when(dmg, F.lit(CLASS_NAME_TO_INDEX["Damage/Impact"]))
+         .otherwise(F.lit(CLASS_NAME_TO_INDEX["Other"]))
+         .cast("int")
     )
 
-    assembler = VectorAssembler(inputCols=used_feats, outputCol="features")
-    rf = RandomForestClassifier(
+
+# ─────────────────────────────────────────────────────────────
+# Pesi di classe smorzati: sqrt per non “sovra-spingere” minoritarie
+# ─────────────────────────────────────────────────────────────
+def _add_class_weights(df: DataFrame, label_col: str = "label") -> DataFrame:
+    counts = df.groupBy(label_col).count()
+    total = df.count()
+    num_classes = len(CLASS_INDEX)
+    weights = counts.withColumn(
+        "weight_raw",
+        (F.lit(float(total)) / F.lit(float(num_classes))) / F.col("count").cast("double")
+    ).withColumn(
+        "weight", F.sqrt(F.col("weight_raw"))
+    ).select(label_col, "weight")
+    return df.join(weights, on=label_col, how="left")
+
+
+# ─────────────────────────────────────────────────────────────
+# Pipeline leggera: StopWords → CV → IDF → Assembler → LR
+# ─────────────────────────────────────────────────────────────
+def _build_pipeline(min_df_tokens: int = 10, vocab_size: int = 5000, binary_cv: bool = True) -> Pipeline:
+    remover = StopWordsRemover(
+        inputCol="all_tokens",
+        outputCol="clean_tokens",
+        stopWords=StopWordsRemover.loadDefaultStopWords("english") + [
+            "rt", "amp", "https", "http", "co", "www", "com"
+        ],
+    )
+
+    cv = CountVectorizer(
+        inputCol="clean_tokens",
+        outputCol="tf_text",
+        minDF=int(min_df_tokens),
+        vocabSize=int(vocab_size),
+        binary=binary_cv
+    )
+
+    idf = IDF(inputCol="tf_text", outputCol="vec_text")
+
+    assembler = VectorAssembler(
+        inputCols=["vec_text", "mentions_count", "is_rt", "verified", "hour_of_day"],
+        outputCol="features"
+    )
+
+    lr = LogisticRegression(
         featuresCol="features",
         labelCol="label",
-        weightCol="cls_weight",
-        numTrees=int(n_trees),
-        seed=42,
+        weightCol="weight",
+        predictionCol="prediction",
+        probabilityCol="probability",
+        rawPredictionCol="rawPrediction",
+        maxIter=40,
+        regParam=0.2,
+        elasticNetParam=0.0,   # L2
+        family="multinomial"
     )
 
-    pipe = Pipeline(stages=[assembler, rf])
-    model = pipe.fit(train)
+    return Pipeline(stages=[remover, cv, idf, assembler, lr])
 
-    # valutazione
-    pred_test = model.transform(test)
-    precision, recall, f1, cm = _compute_metrics(pred_test)
 
-    if debug_logs:
-        print(f"[DEBUG] class_weights: {class_weights}")
-        print(f"[DEBUG] Precision={precision:.4f} Recall={recall:.4f} F1={f1:.4f}")
-        print("[DEBUG] CM:", cm)
+# ─────────────────────────────────────────────────────────────
+# Metriche
+# ─────────────────────────────────────────────────────────────
+def _compute_metrics(pred_df: DataFrame) -> Dict[str, Any]:
+    pairs = pred_df.select(
+        F.col("label").cast("int").alias("label"),
+        F.col("prediction").cast("int").alias("pred")
+    )
+    counts = pairs.groupBy("label", "pred").count()
+    n = len(CLASS_INDEX)
+    mat = [[0 for _ in range(n)] for _ in range(n)]
+    for r in counts.collect():
+        mat[int(r["label"])][int(r["pred"])] = int(r["count"])
 
-    # salvataggi
-    ts = _now_tag()
-    run_dir = f"{model_root.rstrip('/')}/rf_{ts}"
-    model.write().overwrite().save(os.path.join(run_dir, "model"))
+    per_class: Dict[str, Dict[str, float]] = {}
+    total_correct, total = 0, sum(sum(row) for row in mat)
+    for i in range(n):
+        tp = mat[i][i]
+        fp = sum(mat[r][i] for r in range(n) if r != i)
+        fn = sum(mat[i][c] for c in range(n) if c != i)
+        tn = total - tp - fp - fn
+        prec = tp/(tp+fp) if (tp+fp) else 0.0
+        rec  = tp/(tp+fn) if (tp+fn) else 0.0
+        f1   = (2*prec*rec)/(prec+rec) if (prec+rec) else 0.0
+        per_class[CLASS_INDEX[i]] = {"precision": prec, "recall": rec, "f1": f1, "TP": tp, "FP": fp, "TN": tn, "FN": fn}
+        total_correct += tp
 
-    metrics = {
-        "viral_quantile": float(viral_quantile),
-        "row_used": int(df.count()),
-        "file_used": len(files),
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "confusion_matrix": cm,
-        "n_trees": int(n_trees),
-        "class_weights": class_weights,
+    macro_f1 = sum(per_class[c]["f1"] for c in per_class)/float(n) if n else 0.0
+    accuracy = total_correct/float(total) if total else 0.0
+
+    return {
+        "accuracy": accuracy,
+        "macro_f1": macro_f1,
+        "per_class": per_class,
+        "confusion_matrix": {"labels": [CLASS_INDEX[i] for i in range(n)], "as_table": mat}
     }
-    _ensure_dir(model_root)
-    _write_small_json(metrics, os.path.join(run_dir, "metrics.json"))
-    with open(os.path.join(model_root, "latest_path.txt"), "w", encoding="utf-8") as f:
-        f.write(run_dir + "\n")
 
-    return metrics
 
-def load_latest_model(model_root: str) -> Optional[PipelineModel]:
-    run_dir = _find_latest_run(model_root)
-    if not run_dir:
-        return None
-    try:
-        return PipelineModel.load(os.path.join(run_dir, "model"))
-    except Exception:
-        return None
+# ─────────────────────────────────────────────────────────────
+# Route FastAPI: /model/*
+# ─────────────────────────────────────────────────────────────
+def add_model_routes(app: FastAPI,
+                     spark: SparkSession,
+                     prepared_dir: str,
+                     model_root: str,
+                     default_files_limit: Optional[int] = None) -> None:
+    """
+    Monta le route del modello su un'app FastAPI già esistente.
+    """
+    MODEL_PATH = os.path.join(model_root, MODEL_SUBDIR)
+    META_PATH  = os.path.join(model_root, META_FILENAME)
+    os.makedirs(model_root, exist_ok=True)
 
-def _load_run_metrics(model_root: str, run_dir: Optional[str]) -> Optional[dict]:
-    if not run_dir:
-        return None
-    p = os.path.join(run_dir, "metrics.json")
-    if os.path.isfile(p):
+    def _load_model_if_exists() -> Optional[PipelineModel]:
         try:
-            with open(p, "r", encoding="utf-8") as f:
-                return json.load(f)
+            if os.path.isdir(MODEL_PATH):
+                return PipelineModel.load(MODEL_PATH)
         except Exception:
-            return None
-    return None
+            pass
+        return None
 
-# ─────────────────────────────────────────────────────────
-# API (identica: nessuna modifica al main)
-# ─────────────────────────────────────────────────────────
-def add_model_routes(
-    app: FastAPI,
-    spark: SparkSession,
-    prepared_dir: str,
-    model_root: str,
-    default_files_limit: Optional[int] = None,
-):
-    state: Dict[str, Optional[str]] = {"last_run_dir": _find_latest_run(model_root)}
-
-    def _effective_limit(param_limit: Optional[int]) -> Optional[int]:
-        return param_limit if param_limit is not None else default_files_limit
-
-    # ---- TRAIN
-    @app.post("/model/train")
-    def model_train(
-        files_limit: Optional[int] = Query(None, ge=1, le=100000),
-        viral_quantile: float = Query(0.70, ge=0.5, le=0.999),
-        viral_threshold: Optional[int] = Query(None, ge=1),
-        n_trees: int = Query(100, ge=10, le=500),
-        max_bins: int = Query(128, ge=32, le=2048),     # compat (ignorati)
-        top_k_lang: int = Query(30, ge=5, le=200),      # compat (ignorati)
-        top_k_device: int = Query(30, ge=5, le=200),    # compat (ignorati)
-        debug_logs: bool = Query(True),
-    ):
-        eff_limit = _effective_limit(files_limit)
-        metrics = train_classifier(
-            spark=spark,
-            prepared_dir=prepared_dir,
-            model_root=model_root,
-            files_limit=eff_limit,
-            viral_quantile=viral_quantile,
-            viral_threshold=viral_threshold,
-            n_trees=n_trees,
-            max_bins=max_bins,
-            top_k_lang=top_k_lang,
-            top_k_device=top_k_device,
-            debug_logs=bool(debug_logs),
-        )
-        state["last_run_dir"] = _find_latest_run(model_root)
-        return JSONResponse({"status": "ok", "metrics": metrics})
-
-    # ---- LATEST
-    @app.get("/model/latest")
-    def model_latest():
-        run_dir = state["last_run_dir"] or _find_latest_run(model_root)
-        if not run_dir:
-            return JSONResponse({"status": "empty", "message": "Nessun modello trovato"}, status_code=404)
-
-        out = {"run_dir": run_dir}
-        metrics_path = os.path.join(run_dir, "metrics.json")
-        if os.path.isfile(metrics_path):
+    def _load_meta() -> Dict[str, Any]:
+        if os.path.isfile(META_PATH):
             try:
-                with open(metrics_path, "r", encoding="utf-8") as f:
-                    out["metrics"] = json.load(f)
+                with open(META_PATH, "r", encoding="utf-8") as f:
+                    return json.load(f)
             except Exception:
-                pass
-        return JSONResponse(out)
+                return {}
+        return {}
 
-    # ---- PREDICT
-    @app.get("/model/predict")
-    def model_predict(
-        text: str = Query(..., min_length=1),
-        hashtags: int = Query(0, ge=0),
-        mentions: int = Query(0, ge=0),
-        is_rt: int = Query(0, ge=0, le=1),
-        verified: int = Query(0, ge=0, le=1),
-        hour: int = Query(12, ge=0, le=23),
-        followers: int = Query(0, ge=0),
-        friends: int = Query(0, ge=0),
-        statuses: int = Query(0, ge=0),
-        # compat: accettiamo ma NON usiamo direttamente
-        lang: str = Query("unknown"),
-        device: str = Query("Unknown"),
-    ):
-        run_dir = state["last_run_dir"] or _find_latest_run(model_root)
-        if not run_dir:
-            return JSONResponse({"status": "empty", "message": "Nessun modello trovato"}, status_code=404)
-
-        pipe = load_latest_model(model_root)
-        if pipe is None:
-            return JSONResponse({"status": "error", "message": "Impossibile caricare il modello"}, status_code=500)
-
-        # prova a recuperare l'assembler per sapere quali feature sono state usate
-        try:
-            stages = pipe.stages
-            assembler = next(s for s in stages if isinstance(s, VectorAssembler))
-            used_feats = list(assembler.getInputCols())
-        except Exception:
-            # fallback (non dovrebbe servire): usa i candidati
-            used_feats = [c for c in CANDIDATE_FEATURES]
-
-        # valori derivabili dagli input della route
-        hour_sin = math.sin(2.0 * math.pi * (hour / 24.0))
-        hour_cos = math.cos(2.0 * math.pi * (hour / 24.0))
-        values = {
-            "len_text": len(text),
-            "word_count": len(text.split()),
-            "hashtags_count": int(hashtags),
-            "mentions_count": int(mentions),
-            "is_rt": int(is_rt),
-            "verified": int(verified),
-            "hour_sin": float(hour_sin),
-            "hour_cos": float(hour_cos),
-            "log_followers": math.log1p(max(0, followers)),
-            "log_friends": math.log1p(max(0, friends)),
-            "log_statuses": math.log1p(max(0, statuses)),
-        }
-        # costruisci SOLO le colonne usate in training (manca? → 0)
-        row = [tuple(values.get(c, 0) for c in used_feats)]
-        df_in = spark.createDataFrame(row, used_feats)
-
-        res = pipe.transform(df_in).select("probability","prediction").first()
+    @app.get("/model/status")
+    def model_status():
+        present = os.path.isdir(MODEL_PATH)
+        meta = _load_meta()
         return JSONResponse({
-            "prob_viral": float(res["probability"][1]),
-            "prediction": int(res["prediction"])
+            "model_present": present,
+            "model_path": MODEL_PATH,
+            "classes": CLASS_INDEX,
+            "keywords": KEYWORDS,
+            "meta": meta,
+            "default_files_limit_from_main": default_files_limit
+        })
+
+    @app.get("/model/labels")
+    def get_labels():
+        return JSONResponse({"classes": CLASS_INDEX, "keywords": KEYWORDS})
+
+    @app.get("/model/rules")  # alias retro-compatibile
+    def get_rules_alias():
+        return get_labels()
+
+    @app.post("/model/train")
+    def train_model(
+        files_limit: Optional[int] = Query(None, description="Override del limite file (se assente, usa quello del main)"),
+        min_df_tokens: int = Query(10, description="minDF per CountVectorizer (filtra token rari)"),
+        vocab_size: int = Query(5000, description="limite massimo del vocabolario per CountVectorizer"),
+        dynamic_shuffle: bool = Query(True, description="adatta spark.sql.shuffle.partitions al numero di file"),
+        binary_cv: bool = Query(True, description="CountVectorizer in modalità binaria (meno burstiness)")
+    ):
+        # 1) Limite file effettivo
+        resolved_limit = files_limit if (files_limit is not None) else (default_files_limit if default_files_limit is not None else None)
+
+        # 2) Shuffle partitions conservative
+        if dynamic_shuffle:
+            if resolved_limit is not None:
+                target_parts = max(2, min(resolved_limit * 2, 64))
+            else:
+                target_parts = 32
+            spark.conf.set("spark.sql.shuffle.partitions", str(target_parts))
+        else:
+            target_parts = int(spark.conf.get("spark.sql.shuffle.partitions", "256"))
+
+        # 3) Input files
+        files = _list_json_files(prepared_dir, resolved_limit)
+        if not files:
+            raise HTTPException(404, detail="Nessun file trovato in prepared_dir.")
+        files_sample = files[:min(3, len(files))]
+
+        # 4) Lettura dataset minimo
+        df = spark.read.option("mode", "PERMISSIVE").json(files)
+        _require_cols(df, ["text_full", "hashtags_arr", "mentions_count", "is_rt", "verified", "hour_of_day"])
+
+        empty_arr = F.lit([]).cast("array<string>")
+        base = df.select(
+            F.coalesce(F.col("text_full").cast("string"), F.lit("")).alias("text_full"),
+            F.coalesce(F.col("hashtags_arr").cast("array<string>"), empty_arr).alias("hashtags_arr"),
+            F.col("mentions_count").cast("double").alias("mentions_count"),
+            F.col("is_rt").cast("double").alias("is_rt"),
+            F.col("verified").cast("double").alias("verified"),
+            F.col("hour_of_day").cast("double").alias("hour_of_day"),
+        )
+
+        # 5) Etichette silver e pesi
+        labeled = _label_silver(base)
+        labeled = _add_class_weights(labeled)
+
+        # 6) Split
+        train_df, test_df = labeled.randomSplit([0.8, 0.2], seed=42)
+
+        # 7) Tokenizzazione + concat con hashtag
+        tokenizer = RegexTokenizer(
+            inputCol="text_full", outputCol="tokens",
+            pattern="[^\\p{L}\\p{N}]+", minTokenLength=2, toLowercase=True
+        )
+        train_tok = tokenizer.transform(train_df).withColumn(
+            "all_tokens",
+            F.concat(
+                F.coalesce(F.col("tokens"), empty_arr),
+                F.coalesce(F.col("hashtags_arr"), empty_arr)
+            )
+        )
+        test_tok = tokenizer.transform(test_df).withColumn(
+            "all_tokens",
+            F.concat(
+                F.coalesce(F.col("tokens"), empty_arr),
+                F.coalesce(F.col("hashtags_arr"), empty_arr)
+            )
+        )
+
+        # 8) Persist con spill su disco
+        train_tok = train_tok.persist(StorageLevel.MEMORY_AND_DISK)
+        test_tok  = test_tok.persist(StorageLevel.MEMORY_AND_DISK)
+        _ = train_tok.count(); _ = test_tok.count()
+
+        # 9) Pipeline e fit
+        pipe = _build_pipeline(min_df_tokens=min_df_tokens, vocab_size=vocab_size, binary_cv=binary_cv)
+        model = pipe.fit(train_tok)
+
+        # 10) Valutazione
+        pred_test = model.transform(test_tok)
+        metrics = _compute_metrics(pred_test)
+
+        # 11) Salva modello (overwrite)
+        if os.path.isdir(MODEL_PATH):
+            shutil.rmtree(MODEL_PATH, ignore_errors=True)
+        model.write().overwrite().save(MODEL_PATH)
+
+        # 12) Metadati
+        with open(META_PATH, "w", encoding="utf-8") as f:
+            json.dump({
+                "classes": CLASS_INDEX,
+                "keywords": KEYWORDS,
+                "min_df_tokens": min_df_tokens,
+                "vocab_size": vocab_size,
+                "binary_cv": binary_cv,
+                "default_files_limit_from_main": default_files_limit
+            }, f, ensure_ascii=False, indent=2)
+
+        # 13) Cleanup persist
+        try:
+            train_tok.unpersist()
+            test_tok.unpersist()
+        except Exception:
+            pass
+
+        return JSONResponse({
+            "resolved_files_limit": resolved_limit,
+            "used_files": len(files),
+            "files_sample": files_sample,
+            "shuffle_partitions_used": target_parts,
+            "min_df_tokens_used": min_df_tokens,
+            "vocab_size_used": vocab_size,
+            "binary_cv_used": binary_cv,
+            "model_path": MODEL_PATH,
+            "metrics": metrics
+        })
+
+    @app.post("/model/predict")
+    def predict(payload: Dict[str, Any] = Body(...)):
+        """
+        Predizione con body JSON. Esempio body:
+        {
+          "text_full": "help me please",
+          "hashtags_arr": ["help"],
+          "mentions_count": 1,
+          "is_rt": 1,
+          "verified": 1,
+          "hour_of_day": 12
+        }
+        """
+        # 1) Modello
+        model = _load_model_if_exists()
+        if model is None:
+            raise HTTPException(404, detail="Modello non addestrato. Esegui /model/train prima.")
+
+        # 2) Input minimo
+        text_full = str(payload.get("text_full", "") or "")
+        hashtags  = payload.get("hashtags_arr", []) or []
+        mentions  = float(payload.get("mentions_count", 0.0))
+        is_rt     = float(payload.get("is_rt", 0.0))
+        verified  = float(payload.get("verified", 0.0))
+        hour      = float(payload.get("hour_of_day", 0.0))
+
+        schema = T.StructType([
+            T.StructField("text_full", T.StringType(), True),
+            T.StructField("hashtags_arr", T.ArrayType(T.StringType()), True),
+            T.StructField("mentions_count", T.DoubleType(), True),
+            T.StructField("is_rt", T.DoubleType(), True),
+            T.StructField("verified", T.DoubleType(), True),
+            T.StructField("hour_of_day", T.DoubleType(), True),
+        ])
+        df_one = spark.createDataFrame([(text_full, hashtags, mentions, is_rt, verified, hour)], schema=schema)
+
+        # 3) Token + concat coerente col training
+        empty_arr = F.lit([]).cast("array<string>")
+        tokenizer = RegexTokenizer(
+            inputCol="text_full", outputCol="tokens",
+            pattern="[^\\p{L}\\p{N}]+", minTokenLength=2, toLowercase=True
+        )
+        df_one_tok = tokenizer.transform(df_one).withColumn(
+            "all_tokens",
+            F.concat(
+                F.coalesce(F.col("tokens"), empty_arr),
+                F.coalesce(F.col("hashtags_arr"), empty_arr)
+            )
+        )
+
+        # 4) Predizione
+        out = model.transform(df_one_tok).select("prediction", "probability").first()
+        pred_idx = int(out["prediction"])
+        prob_vec = out["probability"]
+        try:
+            probs = [float(x) for x in prob_vec.toArray().tolist()]
+        except AttributeError:
+            probs = [float(x) for x in prob_vec]
+
+        return JSONResponse({
+            "predicted_class_index": pred_idx,
+            "predicted_class_name": CLASS_INDEX.get(pred_idx, "Unknown"),
+            "probabilities": probs
         })
