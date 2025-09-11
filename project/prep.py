@@ -1,28 +1,24 @@
 # project/prep.py
 from pyspark.sql import functions as F
 from pyspark.sql import DataFrame
-import os, glob, shutil, json
+import os, glob, shutil
 
 # ─────────────────────────────────────────────────────────
-# Utility base (stile cleaning.py)
+# Utility
 # ─────────────────────────────────────────────────────────
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
 def write_single_jsonl(df: DataFrame, final_out_file: str):
     """
-    Scrive df in UN SOLO file .jsonl:
-    - coalesce(1) per una sola partizione
-    - scrive in cartella temporanea
-    - rinomina 'part-*.json' nel path finale
-    - se il file finale esiste, lo SOVRASCRIVE
+    Scrive il DataFrame in UN SOLO file .jsonl (non compresso).
     """
     ensure_dir(os.path.dirname(final_out_file))
     temp_dir = final_out_file + ".tmpdir"
     if os.path.exists(temp_dir):
         shutil.rmtree(temp_dir)
 
-    # Scrittura (non compresso): genererà part-*.json (+ _SUCCESS, .crc interni)
+    # Genera part-*.json (+ _SUCCESS, .crc interni)
     df.coalesce(1).write.mode("overwrite").json(temp_dir)
 
     # Trova il part file
@@ -46,30 +42,27 @@ def write_single_jsonl(df: DataFrame, final_out_file: str):
     elif not final_out_file.endswith(".jsonl"):
         final_out_file = final_out_file + ".jsonl"
 
-    # Sovrascrivi se esiste
+    # Sovrascrive se esiste
     if os.path.exists(final_out_file):
         os.remove(final_out_file)
 
-    # Sposta il singolo file e rimuovi la tmp (niente .crc persistenti)
+    # Sposta il singolo file e rimuovi la tmp dir
     shutil.move(part_file, final_out_file)
     shutil.rmtree(temp_dir, ignore_errors=True)
     print(f"[OK] File unico scritto: {final_out_file}")
 
 def list_cleaned_files(folder: str):
     """
-    Restituisce i file 'cleaned' in new_ds (primo livello):
-    - *_cleaned.jsonl preferiti
-    - fallback: .jsonl / .json
+    Restituisce la lista di file 'cleaned' in una cartella.
     """
     if not os.path.isdir(folder):
         print(f"[ATTENZIONE] Cartella cleaned non valida: {folder}")
         return []
-    # Preferisci i *_cleaned.jsonl se presenti
+    # Prima cerca *_cleaned.jsonl
     cleaned = sorted(glob.glob(os.path.join(folder, "*_cleaned.jsonl")))
     if cleaned:
         print(f"[INFO] Trovati {len(cleaned)} file *_cleaned.jsonl")
         return cleaned
-
     # Altrimenti prendi jsonl/json singoli
     patterns = ["*.jsonl", "*.json"]
     out = []
@@ -80,12 +73,12 @@ def list_cleaned_files(folder: str):
     return out
 
 # ─────────────────────────────────────────────────────────
-# Normalizzazione 'place' (no UDF) — la tua versione
+# Normalizzazione 
 # ─────────────────────────────────────────────────────────
 def _canon_place(col):
-    c = F.lower(F.trim(col))
-    c = F.regexp_replace(c, r"\([^)]*\)", "")                   # rimuovi parentesi
-    c = F.regexp_replace(c, r"[.']", "")                        # rimuovi . e '
+    c = F.lower(F.trim(col))                                    # minuscole, trim                  
+    c = F.regexp_replace(c, r"\([^)]*\)", "")                   # rimuove parentesi
+    c = F.regexp_replace(c, r"[.']", "")                        # rimuove . e '
     c = F.regexp_replace(c, r"\s+", " ")                        # normalizza spazi
     c = F.regexp_replace(c, r"\s*,\s*", ", ")                   # normalizza virgole
 
@@ -97,29 +90,32 @@ def _canon_place(col):
     c = F.when(c == F.lit("la"), F.lit("los angeles")).otherwise(c)
     c = F.regexp_replace(c, r"\bwashington,? d ?c\b", "washington")
 
+    # rimuove coda con paesi, stati, province
     us_state_codes = "(?:al|ak|az|ar|ca|co|ct|dc|de|fl|ga|hi|ia|id|il|in|ks|ky|la|ma|md|me|mi|mn|mo|ms|mt|nc|nd|ne|nh|nj|nm|nv|ny|oh|ok|or|pa|ri|sc|sd|tn|tx|ut|va|vt|wa|wi|wv)"
     us_state_names = "(?:alabama|alaska|arizona|arkansas|california|colorado|connecticut|delaware|florida|georgia|hawaii|idaho|illinois|indiana|iowa|kansas|kentucky|louisiana|maine|maryland|massachusetts|michigan|minnesota|mississippi|missouri|montana|nebraska|nevada|new hampshire|new jersey|new mexico|new york|north carolina|north dakota|ohio|oklahoma|oregon|pennsylvania|rhode island|south carolina|south dakota|tennessee|texas|utah|vermont|virginia|washington|west virginia|wisconsin|wyoming|district of columbia|dc)"
     ca_prov_codes = "(?:ab|bc|mb|nb|nl|ns|nt|nu|on|pe|qc|sk|yt)"
     ca_prov_names = "(?:ontario|quebec|british columbia|alberta|manitoba|saskatchewan|nova scotia|new brunswick|newfoundland and labrador|prince edward island|northwest territories|nunavut|yukon)"
     countries = "(?:united states|usa|america|united kingdom|uk|england|scotland|wales|northern ireland|canada|india|nigeria|australia)"
 
+    # due versioni: con o senza virgola
     tail_with_comma = f"(?:,\\s*{countries}|,\\s*{us_state_codes}|,\\s*{us_state_names}|,\\s*{ca_prov_codes}|,\\s*{ca_prov_names})"
     tail_no_comma   = f"(?:\\s+{countries}|\\s+{us_state_codes}|\\s+{us_state_names}|\\s+{ca_prov_codes}|\\s+{ca_prov_names})"
     c = F.regexp_replace(c, f"(?:{tail_with_comma})+$", "")
     c = F.regexp_replace(c, f"(?:{tail_no_comma})+$", "")
 
-    c = F.regexp_replace(c, r"(,?\s*\b(city|county)\b)+$", "")  # rimuovi city/county finali
+    c = F.regexp_replace(c, r"(,?\s*\b(city|country)\b)+$", "")  # rimuove city/country finali
     c = F.regexp_replace(c, r"\s*,\s*$", "")                    # pulizia finale
-    c = F.regexp_replace(c, r"\s+", " ")
+    c = F.regexp_replace(c, r"\s+", " ")                        # normalizza spazi
     return F.trim(c)
 
 # ─────────────────────────────────────────────────────────
-# Prep (come nel tuo query.py) + place_norm
+# Prep 
 # ─────────────────────────────────────────────────────────
-from pyspark.sql import DataFrame, functions as F
-
 def prep(df: DataFrame) -> DataFrame:
-    # parsing robusto del created_at di Twitter
+    """
+    Applica la preparazione al DataFrame in input e restituisce il DataFrame preparato con nuove colonne derivate.
+    """
+    # colonna 'ts' robusta da 'created_at'
     arr = F.split(F.col("created_at"), r"\s+")
     mon_abbr = arr.getItem(1)
     day      = F.lpad(arr.getItem(2), 2, "0")
@@ -127,6 +123,7 @@ def prep(df: DataFrame) -> DataFrame:
     zone     = arr.getItem(4)
     year     = arr.getItem(5)
 
+    # mappa mesi
     month_map = F.create_map(
         F.lit("Jan"), F.lit("01"), F.lit("Feb"), F.lit("02"), F.lit("Mar"), F.lit("03"),
         F.lit("Apr"), F.lit("04"), F.lit("May"), F.lit("05"), F.lit("Jun"), F.lit("06"),
@@ -142,6 +139,8 @@ def prep(df: DataFrame) -> DataFrame:
     )
     ts = F.coalesce(ts_robust, F.to_timestamp(F.col("created_at")))
 
+    # colonne derivate
+    # engagement = somma di retweet + like (sia per tweet che retweet)
     fav_src = F.coalesce(
         F.col("retweeted_status.favorite_count").cast("long"),
         F.col("favorite_count").cast("long")
@@ -151,6 +150,7 @@ def prep(df: DataFrame) -> DataFrame:
         F.col("retweet_count").cast("long")
     )
 
+    # Base di DataFrame con nuove colonne
     base = (
         df.withColumn("ts", ts)
           .withColumn("text_full", F.coalesce(F.col("extended_tweet.full_text"), F.col("text")))
@@ -178,7 +178,7 @@ def prep(df: DataFrame) -> DataFrame:
           .withColumn("place", F.coalesce(F.col("place.full_name"), F.col("place.name"), F.col("user.location")))
     )
 
-    # ──> Nuove colonne temporali (UTC)
+    # Nuove colonne temporali (UTC)
     base = (
         base.withColumn("ts", F.to_timestamp("ts"))
             .withColumn("hour_ts",     F.date_trunc("hour", F.col("ts")).cast("timestamp"))  # per timeline
@@ -193,9 +193,7 @@ def prep(df: DataFrame) -> DataFrame:
 # ─────────────────────────────────────────────────────────
 def process_single_file(spark, in_file: str, out_dir: str):
     """
-    Legge un file 'cleaned', applica prep() e scrive UN SOLO .jsonl in out_dir.
-    Mantiene il naming coerente: <stem>_prepped.jsonl
-    (se era *_cleaned.jsonl, rimpiazza _cleaned -> _prepped).
+    Applica la preparazione a un singolo file 'cleaned' e salva
     """
     base = os.path.basename(in_file)
     stem, ext = os.path.splitext(base)        # ext include ".jsonl" o ".json"
@@ -217,8 +215,7 @@ def process_single_file(spark, in_file: str, out_dir: str):
 # ─────────────────────────────────────────────────────────
 def run_prep(spark, cleaned_dir: str, prepared_dir: str):
     """
-    Applica la preparazione a tutti i file in 'cleaned_dir' e salva
-    UN file .jsonl per ciascun input in 'prepared_dir'.
+    Applica la preparazione a tutti i file 'cleaned' in una cartella e salva i file 'prepped' in un'altra cartella.
     """
     ensure_dir(prepared_dir)
     files = list_cleaned_files(cleaned_dir)

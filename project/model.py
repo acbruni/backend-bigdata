@@ -35,10 +35,10 @@ CLASS_INDEX = {
 }
 CLASS_NAME_TO_INDEX = {v: k for k, v in CLASS_INDEX.items()}
 
-# parole chiave per etichettatura "silver" (minuscole)
+# parole chiave per etichettatura (minuscole)
 KEYWORDS = {
     "Request/Need": {
-        "text": ["need", "help", "urgent", "please send", "request", "rescue", "shelter needed", "trapped", "asap"],
+        "text": ["need", "help", "urgent", "please send", "request", "rescue", "shelter needed", "trapped", "asap", "please"],
         "tags": ["help", "rescue", "needs", "shelter"]
     },
     "Offer/Donation": {
@@ -56,7 +56,10 @@ KEYWORDS = {
 # Helper
 # ─────────────────────────────────────────────────────────────
 def _list_json_files(prepared_dir: str, limit: Optional[int]) -> List[str]:
-    """Lista deterministica di file .json/.jsonl dentro prepared_dir (e sottocartelle). Applica lo slice al limite."""
+    """
+    Restituisce la lista di file JSON/JSONL in prepared_dir (e sottocartelle),
+    fino a un massimo di 'limit' se specificato e positivo.
+    """
     if not os.path.isdir(prepared_dir):
         return []
     patterns = [
@@ -75,15 +78,21 @@ def _list_json_files(prepared_dir: str, limit: Optional[int]) -> List[str]:
 
 
 def _require_cols(df: DataFrame, cols: List[str]) -> None:
+    """
+    Verifica che il DataFrame contenga tutte le colonne specificate.
+    """
     missing = [c for c in cols if c not in df.columns]
     if missing:
         raise ValueError(f"Mancano colonne richieste: {missing}")
 
 
 # ─────────────────────────────────────────────────────────────
-# Etichette silver (4 classi)
+# Etichette 
 # ─────────────────────────────────────────────────────────────
-def _label_silver(df: DataFrame) -> DataFrame:
+def _label(df: DataFrame) -> DataFrame:
+    """
+    Aggiunge la colonna "label" al DataFrame, basata su parole chi
+    """
     empty_arr = F.lit([]).cast("array<string>")
     txt  = F.lower(F.coalesce(F.col("text_full").cast("string"), F.lit("")))
     tags = F.coalesce(F.col("hashtags_arr").cast("array<string>"), empty_arr)
@@ -113,11 +122,10 @@ def _label_silver(df: DataFrame) -> DataFrame:
          .cast("int")
     )
 
-
-# ─────────────────────────────────────────────────────────────
-# Pesi di classe smorzati: sqrt per non “sovra-spingere” minoritarie
-# ─────────────────────────────────────────────────────────────
 def _add_class_weights(df: DataFrame, label_col: str = "label") -> DataFrame:
+    """
+    Aggiunge la colonna "weight" al DataFrame, basata sulla frequenza
+    """
     counts = df.groupBy(label_col).count()
     total = df.count()
     num_classes = len(CLASS_INDEX)
@@ -131,9 +139,12 @@ def _add_class_weights(df: DataFrame, label_col: str = "label") -> DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────
-# Pipeline leggera: StopWords → CV → IDF → Assembler → LR
+# Pipeline 
 # ─────────────────────────────────────────────────────────────
 def _build_pipeline(min_df_tokens: int = 10, vocab_size: int = 5000, binary_cv: bool = True) -> Pipeline:
+    """
+    Costruisce la pipeline di trasformazioni e classificatore.
+    """
     remover = StopWordsRemover(
         inputCol="all_tokens",
         outputCol="clean_tokens",
@@ -172,11 +183,13 @@ def _build_pipeline(min_df_tokens: int = 10, vocab_size: int = 5000, binary_cv: 
 
     return Pipeline(stages=[remover, cv, idf, assembler, lr])
 
-
 # ─────────────────────────────────────────────────────────────
 # Metriche
 # ─────────────────────────────────────────────────────────────
 def _compute_metrics(pred_df: DataFrame) -> Dict[str, Any]:
+    """
+    Calcola accuratezza, macro F1, per-class precision/recall/F1 e
+    matrice di confusione."""
     pairs = pred_df.select(
         F.col("label").cast("int").alias("label"),
         F.col("prediction").cast("int").alias("pred")
@@ -212,7 +225,7 @@ def _compute_metrics(pred_df: DataFrame) -> Dict[str, Any]:
 
 
 # ─────────────────────────────────────────────────────────────
-# Route FastAPI: /model/*
+# Route FastAPI
 # ─────────────────────────────────────────────────────────────
 def add_model_routes(app: FastAPI,
                      spark: SparkSession,
@@ -245,6 +258,10 @@ def add_model_routes(app: FastAPI,
 
     @app.get("/model/status")
     def model_status():
+        """
+        Restituisce lo stato del modello (presenza, path, classi, keywords,
+        metadati, default_files_limit_from_main).
+        """
         present = os.path.isdir(MODEL_PATH)
         meta = _load_meta()
         return JSONResponse({
@@ -266,16 +283,16 @@ def add_model_routes(app: FastAPI,
 
     @app.post("/model/train")
     def train_model(
-        files_limit: Optional[int] = Query(None, description="Override del limite file (se assente, usa quello del main)"),
-        min_df_tokens: int = Query(10, description="minDF per CountVectorizer (filtra token rari)"),
-        vocab_size: int = Query(5000, description="limite massimo del vocabolario per CountVectorizer"),
-        dynamic_shuffle: bool = Query(True, description="adatta spark.sql.shuffle.partitions al numero di file"),
-        binary_cv: bool = Query(True, description="CountVectorizer in modalità binaria (meno burstiness)")
+        files_limit: Optional[int] = Query(None),
+        min_df_tokens: int = Query(10),
+        vocab_size: int = Query(5000),
+        dynamic_shuffle: bool = Query(True, description="Se true, imposta spark.sql.shuffle.partitions in modo conservativo in base a files_limit."),
+        binary_cv: bool = Query(True, description="Se true, CountVectorizer usa binarizzazione (presenza/assenza) invece di conteggio.")
     ):
-        # 1) Limite file effettivo
+        # 1) Files limit 
         resolved_limit = files_limit if (files_limit is not None) else (default_files_limit if default_files_limit is not None else None)
 
-        # 2) Shuffle partitions conservative
+        # 2) Shuffle partitions
         if dynamic_shuffle:
             if resolved_limit is not None:
                 target_parts = max(2, min(resolved_limit * 2, 64))
@@ -285,13 +302,13 @@ def add_model_routes(app: FastAPI,
         else:
             target_parts = int(spark.conf.get("spark.sql.shuffle.partitions", "256"))
 
-        # 3) Input files
+        # 3) Lista file
         files = _list_json_files(prepared_dir, resolved_limit)
         if not files:
             raise HTTPException(404, detail="Nessun file trovato in prepared_dir.")
         files_sample = files[:min(3, len(files))]
 
-        # 4) Lettura dataset minimo
+        # 4) Lettura e selezione colonne
         df = spark.read.option("mode", "PERMISSIVE").json(files)
         _require_cols(df, ["text_full", "hashtags_arr", "mentions_count", "is_rt", "verified", "hour_of_day"])
 
@@ -305,14 +322,14 @@ def add_model_routes(app: FastAPI,
             F.col("hour_of_day").cast("double").alias("hour_of_day"),
         )
 
-        # 5) Etichette silver e pesi
-        labeled = _label_silver(base)
+        # 5) Etichettatura e pesi
+        labeled = _label(base)
         labeled = _add_class_weights(labeled)
 
-        # 6) Split
+        # 6) Split train/test
         train_df, test_df = labeled.randomSplit([0.8, 0.2], seed=42)
 
-        # 7) Tokenizzazione + concat con hashtag
+        # 7) Tokenizzazione + concat con hashtags
         tokenizer = RegexTokenizer(
             inputCol="text_full", outputCol="tokens",
             pattern="[^\\p{L}\\p{N}]+", minTokenLength=2, toLowercase=True
@@ -332,12 +349,12 @@ def add_model_routes(app: FastAPI,
             )
         )
 
-        # 8) Persist con spill su disco
+        # 8) Persistenza token
         train_tok = train_tok.persist(StorageLevel.MEMORY_AND_DISK)
         test_tok  = test_tok.persist(StorageLevel.MEMORY_AND_DISK)
         _ = train_tok.count(); _ = test_tok.count()
 
-        # 9) Pipeline e fit
+        # 9) Pipeline e fitting
         pipe = _build_pipeline(min_df_tokens=min_df_tokens, vocab_size=vocab_size, binary_cv=binary_cv)
         model = pipe.fit(train_tok)
 
@@ -361,7 +378,7 @@ def add_model_routes(app: FastAPI,
                 "default_files_limit_from_main": default_files_limit
             }, f, ensure_ascii=False, indent=2)
 
-        # 13) Cleanup persist
+        # 13) Cleanup persistenza
         try:
             train_tok.unpersist()
             test_tok.unpersist()
@@ -383,20 +400,12 @@ def add_model_routes(app: FastAPI,
     @app.post("/model/predict")
     def predict(payload: Dict[str, Any] = Body(...)):
         """
-        Predizione con body JSON. Esempio body:
-        {
-          "text_full": "help me please",
-          "hashtags_arr": ["help"],
-          "mentions_count": 1,
-          "is_rt": 1,
-          "verified": 1,
-          "hour_of_day": 12
-        }
+        Esegue la predizione su un singolo esempio.
         """
         # 1) Modello
         model = _load_model_if_exists()
         if model is None:
-            raise HTTPException(404, detail="Modello non addestrato. Esegui /model/train prima.")
+            raise HTTPException(404, detail="Model not found. Train the model first.")
 
         # 2) Input minimo
         text_full = str(payload.get("text_full", "") or "")

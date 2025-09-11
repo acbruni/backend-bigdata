@@ -7,12 +7,8 @@ from pyspark import StorageLevel
 import os, glob, json
 
 # ─────────────────────────────
-# Helpers / compat
+# Helpers 
 # ─────────────────────────────
-try:
-    from fastapi.middleware.cors import CORSMiddleware
-except ImportError:
-    from starlette.middleware.cors import CORSMiddleware
     
 def _MEMORY_ONLY_SER():
     try:
@@ -44,25 +40,22 @@ def _df_to_list(df: DataFrame, limit: int = 100):
     rows = df.limit(max(1, limit)).toJSON().collect()
     return [json.loads(r) for r in rows]
 
-
 # ─────────────────────────────
 # Costruttore dell'app
 # ─────────────────────────────
 def create_app(spark: SparkSession, prepared_dir: str, files_limit: Optional[int] = None) -> FastAPI:
-    app = FastAPI(title="Disaster Tweets API (queries su dati preparati)")
-
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origin_regex=r"^https?://(localhost|127.0.0.1)(:\d+)?$",
-        allow_credentials=True,
-        allow_methods=[""],
-        allow_headers=[""],
-    )
+    """
+    Crea e configura l'app FastAPI per le query sui dati preparati.
+    """
+    app = FastAPI(title="Disaster Tweets API")
 
     df_prepared: DataFrame | None = None
     used_files: List[str] = []
 
     def _load():
+        """
+        Carica (o ricarica) i dati preparati in un DataFrame Spark.
+        """
         nonlocal df_prepared, used_files
         all_files = _list_prep_files(prepared_dir)
         if not all_files:
@@ -83,9 +76,9 @@ def create_app(spark: SparkSession, prepared_dir: str, files_limit: Optional[int
         except Exception:
             pass
 
-    # ---------- helper: epoch ms robusto da hour_ts (timestamp O stringa ISO) ----------
+    # DataFrame pronto per le query
     def _hour_ms():
-        # se è già timestamp, usalo; altrimenti parse ISO 8601 con timezone (X gestisce 'Z')
+        # Converte hour_ts (stringa ISO) in millisecondi epoch
         ts_parsed = F.coalesce(
             F.col("hour_ts").cast("timestamp"),
             F.to_timestamp(F.col("hour_ts"), "yyyy-MM-dd'T'HH:mm:ss.SSSX")
@@ -124,14 +117,14 @@ def create_app(spark: SparkSession, prepared_dir: str, files_limit: Optional[int
 
     @app.get("/top-viral-post")
     def top_viral_post(limit: int = Query(1, ge=1, le=50)):
-        # Root id: originale se presente, altrimenti l'id del tweet retwittato
+        # Radice del tweet 
         base = df_prepared.withColumn(
             "root_id",
             F.coalesce(F.col("retweeted_status.id").cast("long"),
                     F.col("id").cast("long"))
         )
 
-        # Top root per engagement massimo
+        # Engagement totale per root
         top_roots = (
             base.groupBy("root_id")
                 .agg(F.max("engagement").alias("engagement"))
@@ -139,14 +132,14 @@ def create_app(spark: SparkSession, prepared_dir: str, files_limit: Optional[int
                 .limit(int(limit))
         )
 
-        # Prendi una sola riga per root (preferisci originali)
+        # Per ogni root prende il tweet con più engagement (RT o originale)
         picked = (
             top_roots.join(base, on=["root_id", "engagement"], how="inner")
                     .orderBy(F.col("is_rt").asc(), F.col("engagement").desc_nulls_last())
                     .dropDuplicates(["root_id"])
         )
 
-        # Testo da esporre: per RT usa il testo dell'originale se presente
+        # Testo: se è RT, testo del retweet (se presente), altrimenti testo completo o testo breve
         text_display = F.when(
             F.col("is_rt"),
             F.coalesce(F.col("retweeted_status.text"),
@@ -169,10 +162,9 @@ def create_app(spark: SparkSession, prepared_dir: str, files_limit: Optional[int
 
         return JSONResponse(_df_to_list(res, limit))
 
-    # ====== FIX: timeline oraria (hour_ts) + hour_ms robusto ======
     @app.get("/tweets-per-hour")
     def tweets_per_hour(limit: int = Query(100, ge=1, le=2000)):
-        # Ora del giorno 0..23 dalla nuova prep
+        # Numero di tweet per ora del giorno (0–23)
         res = (
             df_prepared.groupBy("hour_of_day")
                     .agg(F.count("*").alias("tweets"))
@@ -195,11 +187,6 @@ def create_app(spark: SparkSession, prepared_dir: str, files_limit: Optional[int
         )
         return JSONResponse(_df_to_list(res, limit))
 
-    @app.get("/top-languages")
-    def top_languages(limit: int = Query(100, ge=1, le=2000)):
-        res = df_prepared.groupBy("lang").agg(F.count(F.lit(1)).alias("tweets")).orderBy(F.col("tweets").desc())
-        return JSONResponse(_df_to_list(res, limit))
-
     @app.get("/top-places")
     def top_places(limit: int = Query(100, ge=1, le=2000)):
         base = df_prepared.filter(F.col("place_norm") != "")
@@ -218,24 +205,6 @@ def create_app(spark: SparkSession, prepared_dir: str, files_limit: Optional[int
         )
         return JSONResponse(_df_to_list(res, limit))
 
-    # ====== FIX: peaks per lang/verified su hour_ts + hour_ms robusto ======
-    @app.get("/peaks-lang-verified")
-    def peaks_lang_verified(limit: int = Query(100, ge=1, le=2000)):
-        res = (
-            df_prepared.groupBy("hour_ts", "lang", "verified")
-                       .agg(
-                           F.count("*").alias("volume"),
-                           F.avg("engagement").alias("avg_engagement")
-                       )
-                       .orderBy(F.col("avg_engagement").desc_nulls_last())
-                       .select(
-                           F.date_format(F.col("hour_ts"), "yyyy-MM-dd'T'HH:mm:ss'Z'").alias("hour"),
-                           _hour_ms().alias("hour_ms"),
-                           "lang", "verified", "volume", "avg_engagement"
-                       )
-        )
-        return JSONResponse(_df_to_list(res, limit))
-
     @app.get("/efficient-hashtags")
     def efficient_hashtags(min_uses: int = Query(100, ge=1, le=100000),
                            limit: int = Query(10, ge=1, le=2000)):
@@ -248,19 +217,6 @@ def create_app(spark: SparkSession, prepared_dir: str, files_limit: Optional[int
         res = stats.filter(F.col("uses") >= min_uses).orderBy(F.col("avg_engagement").desc_nulls_last())
         return JSONResponse(_df_to_list(res, limit))
 
-    @app.get("/device-verified-effect")
-    def device_verified_effect(limit: int = Query(100, ge=1, le=2000)):
-        base = df_prepared.withColumn(
-            "device_norm",
-            F.when(F.trim(F.col("device_norm")) == "", F.lit("Unknown")).otherwise(F.col("device_norm"))
-        )
-        res = (base.groupBy("device_norm", "verified")
-               .agg(F.count("*").alias("volume"),
-                    F.avg("engagement").alias("avg_engagement"))
-               .orderBy(F.col("volume").desc()))
-        return JSONResponse(_df_to_list(res, limit))
-
-    # ====== FIX: geo-temporal con hour_ts + hour_ms robusto ======
     @app.get("/geo-temporal-hotspots")
     def geo_temporal_hotspots(limit: int = Query(100, ge=1, le=2000)):
         base = df_prepared.filter(F.col("place_norm") != "")
@@ -273,13 +229,12 @@ def create_app(spark: SparkSession, prepared_dir: str, files_limit: Optional[int
                 .orderBy(F.col("volume").desc(), F.col("avg_engagement").desc_nulls_last())
                 .select(
                     F.col("place_norm").alias("place"),
-                    F.col("hour_of_day").alias("hour"),     # <-- 0..23 già pronto
+                    F.col("hour_of_day").alias("hour"),    
                     F.col("volume"),
                     F.col("avg_engagement"),
                 )
         )
         return JSONResponse(_df_to_list(res, limit))
-
 
     @app.get("/early-vs-late")
     def early_vs_late(hours: int = Query(2, ge=1, le=48),
@@ -292,8 +247,7 @@ def create_app(spark: SparkSession, prepared_dir: str, files_limit: Optional[int
             .distinct()
         )
 
-        # 2) Prendi le prime hours ore ordinate e ricava la soglia (max di quelle)
-        #    NB: ordine lessicografico su ISO-Z coincide con ordine temporale.
+        # 2) Prende le prime hours ore ordinate e ricava la soglia (max di quelle)
         topN = valid_hours.orderBy(F.col("hour_ts").asc()).limit(int(hours))
         row = topN.agg(F.max("hour_ts").alias("threshold")).first()
         threshold = row["threshold"]
@@ -336,7 +290,6 @@ def create_app(spark: SparkSession, prepared_dir: str, files_limit: Optional[int
         )
         return JSONResponse(_df_to_list(res, limit))
 
-    # ====== invariato concettualmente: ora del giorno (0–23) ======
     @app.get("/top-hours-by-engagement")
     def top_hours_by_engagement(min_volume: int = Query(20, ge=1, le=100000),
                                 limit: int = Query(100, ge=1, le=2000)):
