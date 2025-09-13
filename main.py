@@ -64,14 +64,14 @@ def main():
     # 5) App query (lavora su prep_ds invece che su new_ds)
     app = create_app(spark, PREP_DIR, files_limit=QUERY_FILES_LIMIT)
 
-    # Aggiunta CORS 
+    # CORS middleware 
     app.add_middleware(
-            CORSMiddleware,
-            allow_origin_regex=r"^https?://(localhost|127.0.0.1)(:\d+)?$",
-            allow_credentials=True,
-            allow_methods=[""],
-            allow_headers=[""],
-        )
+        CORSMiddleware,
+        allow_origins=["*"],         
+        allow_credentials=False,    
+        allow_methods=["*"],         
+        allow_headers=["*"],
+    )
 
     # 6) Route modello (lavora su prep_ds invece che su new_ds)
     add_model_routes(app, spark, prepared_dir=PREP_DIR, model_root=MODEL_DIR, default_files_limit=MODEL_FILES_LIMIT)
